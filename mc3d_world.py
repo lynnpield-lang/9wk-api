@@ -4,10 +4,16 @@
 블록 질의(충돌·시야·레이캐스트), 청크 단위 렌더러(디스플레이 리스트)를 담당한다.
 """
 import ctypes
+import json
 import math
+import os
 import random
+import re
+import threading
 import time
+import urllib.request
 from array import array
+from http.client import HTTPException
 
 import OpenGL
 OpenGL.ERROR_CHECKING = False      # 어느 모듈이 먼저 불러도 GL 오류 검사는 끈다 (속도)
@@ -76,6 +82,10 @@ LUMEN_ORE = 34
 GLOW_CAP = 35
 SHROOM_STEM = 36
 LUMEN_LAMP = 37
+STONE_BRICK = 38
+COAL_BLOCK = 39
+IRON_BLOCK = 40
+DIAMOND_BLOCK = 41
 
 # 아이템 ID (인벤토리 및 도구)
 STICK = 101
@@ -103,6 +113,10 @@ IRON_ARMOR = 122
 DIAMOND_ARMOR = 123
 GUNPOWDER = 124
 GLOW_BERRY = 125
+WOOD_SHOVEL = 126
+STONE_SHOVEL = 127
+IRON_SHOVEL = 128
+DIAMOND_SHOVEL = 129
 
 DECOR_BLOCKS = {TALL_GRASS, FLOWER_RED, FLOWER_YELLOW}  # 풀·꽃: 지나갈 수 있고, 블록을 놓으면 덮어쓴다
 GLOW_PLANTS = {GLOW_MOSS, GLOW_VINE, GLOW_SHROOM, SPIRAL_PLANT}    # 빛나는 식물: 지나갈 수 있다
@@ -120,8 +134,10 @@ NON_SOLID_BLOCKS = {AIR, WATER, TORCH, LANTERN, CRYSTAL} | DECOR_BLOCKS | GLOW_P
 TRANSPARENT_BLOCKS = {AIR, WATER, GLASS, LEAVES, TORCH, LANTERN, CRYSTAL} | DECOR_BLOCKS | GLOW_PLANTS   # 시선을 가리지 않는 블록
 GRAVITY_BLOCKS = {SAND, GRAVEL, WOOD, CACTUS}           # 받침이 사라지면 떨어지는 블록
 NEEDS_GROUND = {TORCH, LANTERN, CRYSTAL, GLOW_SHROOM, SPIRAL_PLANT} | DECOR_BLOCKS  # 받침이 사라지면 부서지는 블록
-PICKAXE_BLOCKS = {STONE, COAL_ORE, IRON_ORE, GOLD_ORE, DIAMOND_ORE, BRICK, CLAY, SANDSTONE, ICE, LUMEN_ORE, LUMEN_LAMP}  # 곡괭이로 빨라짐
+PICKAXE_BLOCKS = {STONE, COAL_ORE, IRON_ORE, GOLD_ORE, DIAMOND_ORE, BRICK, CLAY, SANDSTONE, ICE, LUMEN_ORE, LUMEN_LAMP,
+                  STONE_BRICK, COAL_BLOCK, IRON_BLOCK, DIAMOND_BLOCK}  # 곡괭이로 빨라짐
 AXE_BLOCKS = {WOOD, PLANKS, WORKBENCH, LEAVES, CACTUS, SHROOM_STEM, GLOW_CAP}  # 도끼로 빨라지는 블록
+SHOVEL_BLOCKS = {DIRT, GRASS, SAND}  # 삽으로 빨라지는 블록
 
 # 블록별 채굴 소요 시간 (초, 맨손 기준)
 BLOCK_MINING_TIME = {
@@ -132,6 +148,7 @@ BLOCK_MINING_TIME = {
     LANTERN: 0.5, TNT: 0.3, CRYSTAL: 1.2, ICE: 1.5,
     GLOW_MOSS: 0.1, GLOW_VINE: 0.15, GLOW_SHROOM: 0.05, SPIRAL_PLANT: 0.05, LUMEN_ORE: 5.5, GLOW_CAP: 0.5,
     SHROOM_STEM: 1.5, LUMEN_LAMP: 0.6,
+    STONE_BRICK: 4.5, COAL_BLOCK: 6.0, IRON_BLOCK: 8.0, DIAMOND_BLOCK: 10.0,
     BEDROCK: math.inf, WATER: math.inf, AIR: math.inf,
 }
 
@@ -140,6 +157,9 @@ PICKAXE_POWER = {WOOD_PICKAXE: 2.5, STONE_PICKAXE: 5.0, IRON_PICKAXE: 8.5, DIAMO
 
 # 도끼 채굴 속도 배율 (원목·목재·나뭇잎)
 AXE_POWER = {WOOD_AXE: 2.5, STONE_AXE: 4.0, IRON_AXE: 6.0, DIAMOND_AXE: 9.0}
+
+# 삽 채굴 속도 배율 (흙·잔디·모래)
+SHOVEL_POWER = {WOOD_SHOVEL: 2.5, STONE_SHOVEL: 4.0, IRON_SHOVEL: 6.0, DIAMOND_SHOVEL: 9.0}
 
 # 무기 공격력 (맨손은 1). 도끼도 꽤 아프다
 WEAPON_DAMAGE = {WOOD_SWORD: 3, STONE_SWORD: 5, IRON_SWORD: 8, DIAMOND_SWORD: 12,
@@ -172,6 +192,9 @@ ITEM_NAMES = {
     WOOD_AXE: "나무 도끼 (나무 x2.5)", STONE_AXE: "돌 도끼 (나무 x4)", IRON_AXE: "철 도끼 (나무 x6)",
     DIAMOND_AXE: "다이아 도끼 (나무 x9)", IRON_ARMOR: "철 갑옷 (피해 -40%)",
     DIAMOND_ARMOR: "다이아 갑옷 (피해 -60%)", GUNPOWDER: "화약",
+    STONE_BRICK: "석재 벽돌", COAL_BLOCK: "석탄 블록", IRON_BLOCK: "철 블록", DIAMOND_BLOCK: "다이아 블록",
+    WOOD_SHOVEL: "나무 삽 (흙 x2.5)", STONE_SHOVEL: "돌 삽 (흙 x4)", IRON_SHOVEL: "철 삽 (흙 x6)",
+    DIAMOND_SHOVEL: "다이아 삽 (흙 x9)",
 }
 
 # 블록 색상: 단색 또는 (윗면, 옆면)
@@ -213,6 +236,10 @@ BLOCK_COLORS = {
     GLOW_CAP: ((0.28, 0.30, 0.60), (0.20, 0.17, 0.40)),
     SHROOM_STEM: ((0.80, 0.80, 0.74), (0.72, 0.72, 0.68)),
     LUMEN_LAMP: (0.75, 0.95, 1.0),
+    STONE_BRICK: (0.42, 0.41, 0.40),
+    COAL_BLOCK: (0.11, 0.11, 0.12),
+    IRON_BLOCK: (0.84, 0.84, 0.86),
+    DIAMOND_BLOCK: (0.38, 0.86, 0.84),
 }
 BLOCK_ALPHA = {WATER: 0.55, GLASS: 0.4}   # 반투명 블록
 
@@ -229,6 +256,8 @@ ITEM_COLORS = {
     WOOD_AXE: (0.7, 0.52, 0.3), STONE_AXE: (0.6, 0.6, 0.6), IRON_AXE: (0.88, 0.88, 0.88),
     DIAMOND_AXE: (0.35, 0.92, 0.92), IRON_ARMOR: (0.82, 0.82, 0.86), DIAMOND_ARMOR: (0.35, 0.92, 0.92),
     GUNPOWDER: (0.35, 0.35, 0.38), GLOW_BERRY: (0.35, 0.85, 1.0),
+    WOOD_SHOVEL: (0.7, 0.52, 0.3), STONE_SHOVEL: (0.6, 0.6, 0.6), IRON_SHOVEL: (0.88, 0.88, 0.88),
+    DIAMOND_SHOVEL: (0.35, 0.92, 0.92),
 }
 
 # 조합법 ("bench": True 이면 작업대 근처에서만 제작 가능)
@@ -263,6 +292,225 @@ RECIPES = [
     {"result": LUMEN_LAMP, "count": 1, "req": {LUMEN_ORE: 2, GLASS: 1}, "name": "루멘 등", "bench": True},
     {"result": PLANKS, "count": 3, "req": {SHROOM_STEM: 1}, "name": "목재 x3 (버섯 줄기)", "bench": False},
 ]
+
+# 몹을 잡았을 때 나오는 아이템. player_only 는 플레이어가 직접 잡았을 때만 나오는 드롭
+MOB_DROPS = {
+    "pig": [{"item": PORK_RAW, "chance": 1.0, "min": 1, "max": 2, "player_only": False}],
+    "zombie": [{"item": ROTTEN_FLESH, "chance": 1.0, "min": 0, "max": 2, "player_only": False}],
+    "creeper": [{"item": GUNPOWDER, "chance": 1.0, "min": 1, "max": 2, "player_only": False}],
+    "glowbeast": [{"item": GLOW_BERRY, "chance": 1.0, "min": 1, "max": 3, "player_only": False}],
+}
+
+
+# ==============================================================================
+# 1-1. 게임 데이터 API (PrismarineJS minecraft-data)
+#      처음 켤 때 한 번 받아 게임 형식으로 바꾼 뒤 캐시에 저장하고, 그다음부터는 캐시를 쓴다.
+#      받지 못하면 위에 적힌 원래 코드 값으로 그대로 실행한다.
+# ==============================================================================
+API_DATA_VERSION = "1.20"
+API_BASE_URL = f"https://raw.githubusercontent.com/PrismarineJS/minecraft-data/master/data/pc/{API_DATA_VERSION}/"
+API_FILES = ("items", "recipes", "foods", "blocks", "entityLoot")
+API_TIMEOUT = 10.0                   # 파일 하나당 기다리는 시간 (초)
+API_CACHE_VERSION = 1                # 변환 방식이 바뀌면 올린다 (옛 캐시는 다시 받는다)
+API_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mc3d_data_cache.json")
+MIN_MINING_TIME = 0.05               # 단단함 0인 블록도 0으로 나누지 않도록
+DATA_SOURCE_NAMES = {"loading": "게임 데이터 불러오는 중...", "online": "게임 데이터: 온라인",
+                     "cache": "게임 데이터: 캐시", "default": "게임 데이터: 기본값 (인터넷 연결 없음)"}
+
+API_RECIPE_RESULTS = {               # API에서 조합법을 가져올 새 아이템 (기존 조합법은 덮어쓰지 않는다)
+    "wooden_shovel": WOOD_SHOVEL, "stone_shovel": STONE_SHOVEL, "iron_shovel": IRON_SHOVEL,
+    "diamond_shovel": DIAMOND_SHOVEL, "stone_bricks": STONE_BRICK, "coal_block": COAL_BLOCK,
+    "iron_block": IRON_BLOCK, "diamond_block": DIAMOND_BLOCK,
+}
+API_INGREDIENTS = {                  # 게임에 석탄·조약돌이 따로 없어서 비슷한 아이템으로 바꾼다
+    "coal": COAL_ORE, "cobblestone": STONE, "stone": STONE, "oak_planks": PLANKS, "stick": STICK,
+    "iron_ingot": IRON_INGOT, "diamond": DIAMOND,
+}
+API_FOODS = {"porkchop": PORK_RAW, "cooked_porkchop": PORK_COOKED, "apple": APPLE,
+             "rotten_flesh": ROTTEN_FLESH, "golden_apple": GOLDEN_APPLE}
+API_BLOCKS = {                       # 랜턴은 곡괭이 효과가 없어 맨손 17.5초가 되므로 코드 값을 유지한다
+    "grass_block": GRASS, "dirt": DIRT, "stone": STONE, "oak_log": WOOD, "oak_leaves": LEAVES,
+    "coal_ore": COAL_ORE, "iron_ore": IRON_ORE, "gold_ore": GOLD_ORE, "diamond_ore": DIAMOND_ORE,
+    "bricks": BRICK, "glass": GLASS, "sand": SAND, "oak_planks": PLANKS, "crafting_table": WORKBENCH,
+    "torch": TORCH, "cactus": CACTUS, "snow_block": SNOW, "red_terracotta": CLAY, "gravel": GRAVEL,
+    "sandstone": SANDSTONE, "tall_grass": TALL_GRASS, "poppy": FLOWER_RED, "dandelion": FLOWER_YELLOW,
+    "tnt": TNT, "ice": ICE, "stone_bricks": STONE_BRICK, "coal_block": COAL_BLOCK,
+    "iron_block": IRON_BLOCK, "diamond_block": DIAMOND_BLOCK,
+}
+API_MOBS = ("pig", "zombie", "creeper")   # 늑대는 드롭이 없고, glowbeast 는 이 게임에만 있다
+API_DROPS = {"porkchop": PORK_RAW, "rotten_flesh": ROTTEN_FLESH, "gunpowder": GUNPOWDER,
+             "iron_ingot": IRON_INGOT}    # 당근·감자처럼 게임에 없는 드롭은 무시한다
+
+
+def fetch_api_data():
+    """API 파일을 모두 받는다. 하나라도 실패하면 예외가 난다"""
+    raw = {}
+    for name in API_FILES:
+        request = urllib.request.Request(f"{API_BASE_URL}{name}.json", headers={"User-Agent": "minecraft-3d"})
+        with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
+            raw[name] = json.loads(response.read().decode("utf-8"))
+    return raw
+
+
+def _convert_recipe(recipe, names):
+    """API 레시피 하나를 재료 개수와 맨손 조합 여부로 바꾼다. 게임에 없는 재료가 있으면 None"""
+    shape = recipe.get("inShape")
+    cells = [cell for row in shape for cell in row] if shape else recipe["ingredients"]
+    req = {}
+    for cell in cells:
+        if cell is None:
+            continue
+        item = API_INGREDIENTS.get(names.get(cell))
+        if item is None:
+            return None
+        req[item] = req.get(item, 0) + 1
+    if shape:
+        by_hand = len(shape) <= 2 and max(len(row) for row in shape) <= 2      # 2x2 안에 들어가면 맨손
+    else:
+        by_hand = sum(req.values()) <= 4
+    return req, not by_hand
+
+
+def _convert_recipes(raw_items, raw_recipes):
+    names = {item["id"]: item["name"] for item in raw_items}
+    ids = {item["name"]: item["id"] for item in raw_items}
+    recipes = []
+    for api_name, result in API_RECIPE_RESULTS.items():
+        for recipe in raw_recipes[str(ids[api_name])]:          # 나무 종류별 레시피 중 게임에 맞는 첫 번째만
+            converted = _convert_recipe(recipe, names)
+            if converted:
+                req, bench = converted
+                count = recipe["result"]["count"]
+                label = ITEM_NAMES[result].split(" (")[0] + (f" x{count}" if count > 1 else "")
+                recipes.append({"result": result, "count": count, "req": req, "name": label, "bench": bench})
+                break
+        else:
+            raise ValueError(f"조합법을 변환할 수 없음: {api_name}")
+    return recipes
+
+
+def _convert_mining(raw_blocks):
+    """실제 마인크래프트 공식: 맨손 기준 단단함 x 1.5, 도구가 필요한 블록은 단단함 x 5"""
+    blocks = {block["name"]: block for block in raw_blocks}
+    mining = {}
+    for api_name, bid in API_BLOCKS.items():
+        block = blocks[api_name]
+        factor = 5.0 if block.get("harvestTools") else 1.5
+        mining[bid] = max(MIN_MINING_TIME, block["hardness"] * factor)
+    return mining
+
+
+def _convert_drops(raw_loot):
+    loot = {entry["entity"]: entry["drops"] for entry in raw_loot}
+    drops = {}
+    for kind in API_MOBS:
+        drops[kind] = [{"item": API_DROPS[d["item"]], "chance": d["dropChance"], "min": d["stackSizeRange"][0],
+                        "max": d["stackSizeRange"][1], "player_only": bool(d.get("playerKill"))}
+                       for d in loot[kind] if d["item"] in API_DROPS]
+    return drops
+
+
+def convert_api_data(raw):
+    """API 원본을 게임 형식으로 바꾼다"""
+    foods = {food["name"]: food["foodPoints"] for food in raw["foods"]}
+    return {"recipes": _convert_recipes(raw["items"], raw["recipes"]),
+            "foods": {item: int(foods[name]) for name, item in API_FOODS.items()},
+            "mining": _convert_mining(raw["blocks"]),
+            "drops": _convert_drops(raw["entityLoot"])}
+
+
+def parse_game_data(data):
+    """변환된 데이터를 검사하고 JSON 문자열 키를 숫자로 되돌린다. 이상하면 예외가 난다"""
+    def amount(value, low=1):
+        if isinstance(value, bool) or not isinstance(value, int) or value < low:
+            raise ValueError(f"잘못된 값: {value}")
+        return value
+
+    recipes = []
+    for rec in data["recipes"]:
+        req = {int(item): amount(cnt) for item, cnt in rec["req"].items()}
+        if rec["result"] not in API_RECIPE_RESULTS.values() or not req or not set(req) <= set(ITEM_NAMES) \
+                or not isinstance(rec["name"], str) or not isinstance(rec["bench"], bool):
+            raise ValueError("잘못된 조합법")
+        recipes.append({"result": rec["result"], "count": amount(rec["count"]), "req": req,
+                        "name": rec["name"], "bench": rec["bench"]})
+    if len({rec["result"] for rec in recipes}) != len(API_RECIPE_RESULTS):
+        raise ValueError("조합법이 모자람")
+
+    foods = {int(item): amount(value) for item, value in data["foods"].items()}
+    mining = {int(bid): float(value) for bid, value in data["mining"].items()}
+    if set(foods) != set(API_FOODS.values()) or set(mining) != set(API_BLOCKS.values()) \
+            or not all(MIN_MINING_TIME <= value < math.inf for value in mining.values()):
+        raise ValueError("잘못된 음식 또는 채굴 값")
+
+    drops = {}
+    for kind in API_MOBS:
+        drops[kind] = []
+        for d in data["drops"][kind]:
+            if d["item"] not in API_DROPS.values() or not 0.0 <= d["chance"] <= 1.0 \
+                    or amount(d["min"], 0) > amount(d["max"], 0):
+                raise ValueError("잘못된 드롭")
+            drops[kind].append({"item": d["item"], "chance": d["chance"], "min": d["min"], "max": d["max"],
+                                "player_only": bool(d["player_only"])})
+    return {"recipes": recipes, "foods": foods, "mining": mining, "drops": drops}
+
+
+def load_data_cache():
+    """캐시를 읽는다. 없거나 망가졌거나 옛 버전이면 None"""
+    try:
+        with open(API_CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        if cache["cache_version"] != API_CACHE_VERSION or cache["data_version"] != API_DATA_VERSION:
+            return None
+        return parse_game_data(cache)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def save_data_cache(data):
+    """중간에 꺼져도 캐시가 망가지지 않도록 임시 파일에 쓴 뒤 바꿔치기한다"""
+    temp = API_CACHE_FILE + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump({"cache_version": API_CACHE_VERSION, "data_version": API_DATA_VERSION, **data}, f)
+        os.replace(temp, API_CACHE_FILE)
+    except OSError:
+        pass                         # 저장 못 해도 이번 실행에는 받은 데이터를 쓴다
+
+
+def load_game_data():
+    """(출처, 데이터)를 돌려준다. 캐시 -> 온라인 -> 기본값(데이터 None) 순서"""
+    data = load_data_cache()
+    if data is not None:
+        return "cache", data
+    try:
+        data = parse_game_data(convert_api_data(fetch_api_data()))
+    except (OSError, HTTPException, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return "default", None
+    save_data_cache(data)
+    return "online", data
+
+
+def start_game_data_load():
+    """게임이 멈추지 않게 따로 불러온다. 끝나면 돌려준 dict 에 "result" 가 생긴다"""
+    box = {}
+
+    def work():
+        box["result"] = load_game_data()
+
+    threading.Thread(target=work, daemon=True).start()
+    return box
+
+
+def apply_game_data(data):
+    """받은 값을 게임 표에 넣는다. 다른 파일이 import * 로 같은 객체를 쓰므로 새로 대입하지 않는다"""
+    RECIPES.extend(rec for rec in data["recipes"] if rec not in RECIPES)
+    FOOD_VALUES.update(data["foods"])
+    for item, value in data["foods"].items():
+        ITEM_NAMES[item] = re.sub(r"허기 \+\d+", f"허기 +{value}", ITEM_NAMES[item])
+    BLOCK_MINING_TIME.update(data["mining"])
+    MOB_DROPS.update(data["drops"])
+
 
 
 def block_face_colors(bid):
@@ -1869,7 +2117,8 @@ BUILD_BUDGET = 0.006                                  # 한 프레임에 청크 
 TERRAIN_BLOCKS = {GRASS, DIRT, STONE, SAND, COAL_ORE, IRON_ORE, GOLD_ORE, DIAMOND_ORE, BEDROCK, SNOW, CLAY,
                   GRAVEL, SANDSTONE, ICE, LUMEN_ORE}
 FOLIAGE_BLOCKS = {LEAVES}
-CUBE_BLOCKS = {BRICK, GLASS, PLANKS, WORKBENCH, TNT, LUMEN_LAMP}   # 사람이 만든 블록만 네모 유지
+CUBE_BLOCKS = {BRICK, GLASS, PLANKS, WORKBENCH, TNT, LUMEN_LAMP,   # 사람이 만든 블록만 네모 유지
+               STONE_BRICK, COAL_BLOCK, IRON_BLOCK, DIAMOND_BLOCK}
 TERRAIN_TABLE = bytes(1 if i in TERRAIN_BLOCKS else 0 for i in range(256))
 FOLIAGE_TABLE = bytes(1 if i in FOLIAGE_BLOCKS else 0 for i in range(256))
 CAP_TABLE = bytes(1 if i == GLOW_CAP else 0 for i in range(256))

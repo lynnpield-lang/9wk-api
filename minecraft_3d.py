@@ -37,8 +37,7 @@ WEATHER_CHANGES = {
     "rain": (("clear", 0.6), ("rain", 0.2), ("storm", 0.2)),
     "storm": (("rain", 0.6), ("clear", 0.4)),
 }
-MOB_DROPS = {"pig": (PORK_RAW, 1, 2), "zombie": (ROTTEN_FLESH, 0, 2), "creeper": (GUNPOWDER, 1, 2),
-             "glowbeast": (GLOW_BERRY, 1, 3)}
+DROP_PICKUP_RANGE = 8.0            # 플레이어가 잡지 않아도 이 거리 안에서 죽은 몹의 드롭은 줍는다
 GLOW_ITEMS = {TORCH, LANTERN, CRYSTAL} | GLOW_PLANTS      # 손에 들면 막대 끝이 빛나는 아이템
 MAX_WISPS = 70
 SKIN, SHIRT, PANTS, SHOES = (0.93, 0.74, 0.6), (0.2, 0.62, 0.72), (0.25, 0.3, 0.62), (0.3, 0.27, 0.25)
@@ -99,6 +98,8 @@ class Minecraft3D:
         self.state = "MENU"          # MENU / CONTROLS / SEED / PLAYING
         self.save_status = check_save_file()
         self.menu_message = ""
+        self.data_source = "loading"  # loading / online / cache / default
+        self.data_box = start_game_data_load()
         self.notice = ""
         self.notice_timer = 0.0
         self.mouse_locked = False
@@ -360,11 +361,20 @@ class Minecraft3D:
     # ==========================================================================
     # 메인 루프
     # ==========================================================================
+    def poll_game_data(self):
+        """따로 불러온 게임 데이터가 도착하면 메인 스레드에서 적용한다"""
+        if self.data_source == "loading" and "result" in self.data_box:
+            source, data = self.data_box["result"]
+            if data is not None:
+                apply_game_data(data)
+            self.data_source = source
+
     def run(self):
         running = True
         while running:
             dt = min(self.clock.tick(FPS) / 1000.0, 0.1)
             self.notice_timer = max(0.0, self.notice_timer - dt)
+            self.poll_game_data()
             for event in pygame.event.get():
                 if event.type == QUIT:
                     if self.state == "PLAYING":
@@ -871,6 +881,8 @@ class Minecraft3D:
             base /= PICKAXE_POWER.get(self.held_item(), 1.0)
         elif bid in AXE_BLOCKS:
             base /= AXE_POWER.get(self.held_item(), 1.0)
+        elif bid in SHOVEL_BLOCKS:
+            base /= SHOVEL_POWER.get(self.held_item(), 1.0)
         return base
 
     def armor(self):
@@ -1038,13 +1050,22 @@ class Minecraft3D:
 
         for m in self.mobs[:]:
             if m.hp <= 0:
-                if m.killed_by_player and m.kind in MOB_DROPS:
-                    item, lo, hi = MOB_DROPS[m.kind]
-                    self.give(item, random.randint(lo, hi))
+                self.give_mob_drops(m)
                 self.burst(m.x, m.y + m.h / 2, m.z, (0.85, 0.85, 0.85), 15)
                 self.mobs.remove(m)
             elif math.hypot(m.x - p.x, m.z - p.z) > (40 if m.group == "hostile" else 120):
                 self.mobs.remove(m)
+
+    def give_mob_drops(self, m):
+        """드롭은 인벤토리로 바로 들어오므로, 플레이어가 잡았거나 가까이에서 죽었을 때만 준다"""
+        near = math.hypot(m.x - self.player.x, m.z - self.player.z) <= DROP_PICKUP_RANGE
+        if not m.killed_by_player and not near:
+            return
+        for drop in MOB_DROPS.get(m.kind, ()):
+            if drop["player_only"] and not m.killed_by_player:
+                continue
+            if random.random() < drop["chance"]:
+                self.give(drop["item"], random.randint(drop["min"], drop["max"]))
 
     def separate_entities(self):
         """플레이어와 몹, 몹끼리 겹치지 않도록 서로 밀어낸다"""
@@ -1512,12 +1533,14 @@ class Minecraft3D:
             else:                                             # 도구·무기·재료: 손잡이 + 머리
                 col = ITEM_COLORS.get(item, (0.7, 0.7, 0.7))
                 glRotatef(-35, 1, 0, 0)
-                if item in PICKAXE_POWER or item in AXE_POWER or item in WEAPON_DAMAGE or item == STICK:
+                if item in PICKAXE_POWER or item in AXE_POWER or item in SHOVEL_POWER or item in WEAPON_DAMAGE or item == STICK:
                     draw_box(-0.02, -0.05, -0.02, 0.04, 0.42, 0.04, (0.55, 0.38, 0.2))
                     if item in PICKAXE_POWER:
                         draw_box(-0.16, 0.34, -0.025, 0.32, 0.06, 0.05, col)
                     elif item in AXE_POWER:
                         draw_box(-0.02, 0.26, -0.025, 0.14, 0.14, 0.05, col)
+                    elif item in SHOVEL_POWER:
+                        draw_box(-0.06, 0.34, -0.015, 0.12, 0.16, 0.03, col)
                     elif item in WEAPON_DAMAGE:
                         draw_box(-0.03, 0.12, -0.015, 0.06, 0.42, 0.03, col)
                 else:
@@ -1779,6 +1802,9 @@ class Minecraft3D:
         elif item in AXE_POWER:
             draw_2d_rect(x + s * 0.45, y + s * 0.15, s * 0.1, s * 0.75, brown)
             draw_2d_rect(x + s * 0.2, y + s * 0.15, s * 0.3, s * 0.3, col)
+        elif item in SHOVEL_POWER:
+            draw_2d_rect(x + s * 0.45, y + s * 0.35, s * 0.1, s * 0.55, brown)
+            draw_2d_rect(x + s * 0.33, y + s * 0.12, s * 0.34, s * 0.25, col)
         elif item in ARMOR_REDUCTION:
             draw_2d_rect(x + s * 0.25, y + s * 0.3, s * 0.5, s * 0.55, col)
             draw_2d_rect(x + s * 0.12, y + s * 0.18, s * 0.28, s * 0.2, col)
@@ -1860,6 +1886,7 @@ class Minecraft3D:
         }.get(self.save_status, "")
         if message:
             self.draw_text_center(message, pygame.Rect(0, 545, SCREEN_WIDTH, 20), (255, 240, 200), self.bold_font)
+        self.draw_text_center(DATA_SOURCE_NAMES[self.data_source], pygame.Rect(0, 575, SCREEN_WIDTH, 18), (235, 235, 235))
         self.end_2d()
 
     def render_seed(self):
@@ -1910,9 +1937,11 @@ class Minecraft3D:
             "* 몹: 돼지(맞으면 도망) / 늑대(때리면 무리가 함께 공격) / 좀비(보이면 추적, 낮에 불탐) / 크리퍼(접근 후 폭발)",
             "* 블록 물리: 모래·원목·선인장은 받침이 사라지면 떨어지고, 나무를 베면 주변 나뭇잎이 서서히 사라짐",
             "* 낮/밤 6분 주기, 밤과 폭풍우에는 적대몹 출현. 날씨는 맑음 / 비 / 폭풍우로 바뀜",
-            "* 도구·검·유리·벽돌은 작업대 4칸 이내에서만 제작 가능. 곡괭이는 돌·광석 채굴만 빨라짐",
+            "* 도구·검·유리·벽돌은 작업대 4칸 이내에서만 제작 가능. 곡괭이는 돌·광석, 도끼는 나무, 삽은 흙·잔디·모래 채굴만 빨라짐",
             "",
-            "채굴 시간(맨손): 나뭇잎 0.25초 / 모래 0.6 / 흙 0.75 / 목재 1.4 / 원목 2.2 / 돌 4.5 / 철 6.5 / 다이아 9.0",
+            "채굴 시간(맨손): " + " / ".join(f"{name} {BLOCK_MINING_TIME[bid]:g}초" for name, bid in (
+                ("나뭇잎", LEAVES), ("모래", SAND), ("흙", DIRT), ("목재", PLANKS), ("원목", WOOD), ("돌", STONE),
+                ("철", IRON_ORE), ("다이아", DIAMOND_ORE))),
             "",
             "[아무 키나 누르거나 클릭하면 메인 메뉴로 돌아갑니다]",
         ]
