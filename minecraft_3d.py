@@ -871,6 +871,8 @@ class Minecraft3D:
             base /= PICKAXE_POWER.get(self.held_item(), 1.0)
         elif bid in AXE_BLOCKS:
             base /= AXE_POWER.get(self.held_item(), 1.0)
+        elif bid in SHOVEL_BLOCKS:
+            base /= SHOVEL_POWER.get(self.held_item(), 1.0)
         return base
 
     def armor(self):
@@ -1512,12 +1514,14 @@ class Minecraft3D:
             else:                                             # 도구·무기·재료: 손잡이 + 머리
                 col = ITEM_COLORS.get(item, (0.7, 0.7, 0.7))
                 glRotatef(-35, 1, 0, 0)
-                if item in PICKAXE_POWER or item in AXE_POWER or item in WEAPON_DAMAGE or item == STICK:
+                if item in PICKAXE_POWER or item in AXE_POWER or item in SHOVEL_POWER or item in WEAPON_DAMAGE or item == STICK:
                     draw_box(-0.02, -0.05, -0.02, 0.04, 0.42, 0.04, (0.55, 0.38, 0.2))
                     if item in PICKAXE_POWER:
                         draw_box(-0.16, 0.34, -0.025, 0.32, 0.06, 0.05, col)
                     elif item in AXE_POWER:
                         draw_box(-0.02, 0.26, -0.025, 0.14, 0.14, 0.05, col)
+                    elif item in SHOVEL_POWER:
+                        draw_box(-0.06, 0.34, -0.015, 0.12, 0.16, 0.03, col)
                     elif item in WEAPON_DAMAGE:
                         draw_box(-0.03, 0.12, -0.015, 0.06, 0.42, 0.03, col)
                 else:
@@ -1779,6 +1783,9 @@ class Minecraft3D:
         elif item in AXE_POWER:
             draw_2d_rect(x + s * 0.45, y + s * 0.15, s * 0.1, s * 0.75, brown)
             draw_2d_rect(x + s * 0.2, y + s * 0.15, s * 0.3, s * 0.3, col)
+        elif item in SHOVEL_POWER:
+            draw_2d_rect(x + s * 0.45, y + s * 0.35, s * 0.1, s * 0.55, brown)
+            draw_2d_rect(x + s * 0.33, y + s * 0.12, s * 0.34, s * 0.25, col)
         elif item in ARMOR_REDUCTION:
             draw_2d_rect(x + s * 0.25, y + s * 0.3, s * 0.5, s * 0.55, col)
             draw_2d_rect(x + s * 0.12, y + s * 0.18, s * 0.28, s * 0.2, col)
